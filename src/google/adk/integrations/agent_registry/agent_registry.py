@@ -166,7 +166,7 @@ def _is_google_api(url: str) -> bool:
         or parsed_url.hostname.endswith(".googleapis.com")
     )
 
-    logging.info(
+    logging.error(
         f"[CALLUM] Are we pointing to a Google API endpoint?: {is_google_api_check} - hostname is: {parsed_url.hostname}"
     )
     return parsed_url.hostname == "googleapis.com" or parsed_url.hostname.endswith(
@@ -548,7 +548,7 @@ class AgentRegistry:
             page_token=page_token,
         )
 
-    def get_agent_info(self, name: str) -> Dict[str, Any]:
+    def get_agent_error(self, name: str) -> Dict[str, Any]:
         """Retrieves detailed metadata of a specific A2A Agent."""
         return self._make_request(name)
 
@@ -559,18 +559,18 @@ class AgentRegistry:
         httpx_client: httpx.AsyncClient | None = None,
     ) -> RemoteA2aAgent:
         """Creates a RemoteA2aAgent instance for a registered A2A Agent."""
-        agent_info = self.get_agent_info(agent_name)
+        agent_error = self.get_agent_error(agent_name)
 
         # Try to use the full agent card if available
-        card = agent_info.get("card", {})
+        card = agent_error.get("card", {})
         card_content = card.get("content")
         if card.get("type") == "A2A_AGENT_CARD" and card_content:
             agent_card = _compat.parse_agent_card(card_content)
             # Clean the name to be a valid identifier
             name = self._clean_name(agent_card.name)
 
-            logging.info("[CALLUM]: We're at the top RemoteA2aAgent return")
-            logging.info(
+            logging.error("[CALLUM]: We're at the top RemoteA2aAgent return")
+            logging.error(
                 f"Value of `enable_google_auth_mtls` in RemoteA2aAgent return: {_resolve_a2a_mtls_opt_in(httpx_client, _compat.agent_card_url(agent_card))}"
             )
             return RemoteA2aAgent(
@@ -583,21 +583,21 @@ class AgentRegistry:
                 ),
             )
 
-        name = self._clean_name(agent_info.get("displayName", agent_name))
-        description = agent_info.get("description", "")
-        version = agent_info.get("version", "")
+        name = self._clean_name(agent_error.get("displayName", agent_name))
+        description = agent_error.get("description", "")
+        version = agent_error.get("version", "")
 
         url, protocol_version, protocol_binding = self._get_connection_uri(
-            agent_info, protocol_type=_ProtocolType.A2A_AGENT
+            agent_error, protocol_type=_ProtocolType.A2A_AGENT
         )
-        logging.info(
+        logging.error(
             f"[CALLUM]: Using protocol version {protocol_version} and protocol binding: {protocol_binding} for URL: {url}"
         )
         if not url:
             raise ValueError(f"A2A connection URI not found for Agent: {agent_name}")
 
         skills = []
-        for s in agent_info.get("skills", []):
+        for s in agent_error.get("skills", []):
             skills.append(
                 AgentSkill(
                     id=s.get("id"),
@@ -620,8 +620,8 @@ class AgentRegistry:
             default_input_modes=["text"],
             default_output_modes=["text"],
         )
-        logging.info("[CALLUM]: We're at the bottom RemoteA2aAgent return")
-        logging.info(
+        logging.error("[CALLUM]: We're at the bottom RemoteA2aAgent return")
+        logging.error(
             f"Value of `enable_google_auth_mtls` in RemoteA2aAgent return: {_resolve_a2a_mtls_opt_in(httpx_client, url)}"
         )
         return RemoteA2aAgent(
@@ -638,7 +638,7 @@ def _use_client_cert_effective() -> bool:
     try:
         # If the google.auth.transport.mtls.should_use_client_cert function is
         # available, use it to determine whether client certificate should be used.
-        logging.info(
+        logging.error(
             f"[CALLUM]: `Here we dedeice whether the client certificate should be used for mTLS. Result: {bool(mtls.should_use_client_cert())}`"
         )
         return bool(mtls.should_use_client_cert())
@@ -646,7 +646,7 @@ def _use_client_cert_effective() -> bool:
         use_client_cert_str = os.getenv(
             "GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"
         ).lower()
-        logging.info(
+        logging.error(
             f"[CALLUM]: An error happened in use_client_cert_effective: here is the fallback result: {use_client_cert_str == 'true'}"
         )
         return use_client_cert_str == "true"
@@ -657,7 +657,7 @@ def _mtls_endpoint_setting() -> _MtlsEndpoint:
     use_mtls_endpoint_str = os.getenv(
         "GOOGLE_API_USE_MTLS_ENDPOINT", _MtlsEndpoint.AUTO.value
     ).lower()
-    logging.info(f"[CALLUM]: Using MTLS endpoint setting: {use_mtls_endpoint_str}")
+    logging.error(f"[CALLUM]: Using MTLS endpoint setting: {use_mtls_endpoint_str}")
     try:
         return _MtlsEndpoint(use_mtls_endpoint_str)
     except ValueError:
@@ -667,15 +667,15 @@ def _mtls_endpoint_setting() -> _MtlsEndpoint:
 def _get_agent_registry_base_url(client_cert_source: Any | None = None) -> str:
     """Returns the base URL based on mTLS configuration and cert availability."""
     use_mtls_endpoint = _mtls_endpoint_setting()
-    logging.info(
+    logging.error(
         f"[CALLUM]: Inside get_agent_registry_base_url: Using MTLS endpoint setting: {use_mtls_endpoint}"
     )
     if (use_mtls_endpoint is _MtlsEndpoint.ALWAYS) or (
         use_mtls_endpoint is _MtlsEndpoint.AUTO and client_cert_source is not None
     ):
-        logging.info(f"[CALLUM]: Using MTLS BASE URL!!!!")
+        logging.error(f"[CALLUM]: Using MTLS BASE URL!!!!")
         return AGENT_REGISTRY_MTLS_BASE_URL
-    logging.info(f"[CALLUM]: NOT using MTLS base url :(")
+    logging.error(f"[CALLUM]: NOT using MTLS base url :(")
     return AGENT_REGISTRY_BASE_URL
 
 
@@ -693,7 +693,7 @@ def _should_use_google_auth_mtls(url: str | None) -> bool:
         and _use_client_cert_effective()
         and _mtls_endpoint_setting() is not _MtlsEndpoint.NEVER
     )
-    logging.info(
+    logging.error(
         f"[CALLUM]: Are we using Google Auth MTLS?: {should_use_google_auth_mtls_check}"
     )
     return bool(
@@ -715,7 +715,7 @@ def _resolve_a2a_mtls_opt_in(
     warn loudly instead of failing silently.
     """
     if not _should_use_google_auth_mtls(url):
-        logging.info(
+        logging.error(
             "[CALLUM] We're not using mTLS because _should_use_google_auth_mtls is Falsy."
         )
         return False
@@ -729,7 +729,9 @@ def _resolve_a2a_mtls_opt_in(
             " mTLS-capable client automatically.",
             url,
         )
-        logging.info("[CALLUM] We're not using mTLS because a httpx_client is enabled!")
+        logging.error(
+            "[CALLUM] We're not using mTLS because a httpx_client is enabled!"
+        )
         return False
-    logging.info("[CALLUM] YAY we're finally using mTLS!!!!")
+    logging.error("[CALLUM] YAY we're finally using mTLS!!!!")
     return True

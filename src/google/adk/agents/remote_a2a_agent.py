@@ -508,7 +508,7 @@ class RemoteA2aAgent(BaseAgent):
                 if converted_parts:
                     message_parts.extend(converted_parts)
                 else:
-                    logger.warning("Failed to convert part to A2A format: %s", part)
+                    logger.error("Failed to convert part to A2A format: %s", part)
 
         return message_parts, context_id
 
@@ -733,7 +733,7 @@ class RemoteA2aAgent(BaseAgent):
             message_parts, context_id = self._construct_message_parts_from_session(ctx)
 
             if not message_parts:
-                logger.warning(
+                logger.error(
                     "No parts to send to remote A2A agent. Emitting empty event."
                 )
                 yield Event(
@@ -751,7 +751,8 @@ class RemoteA2aAgent(BaseAgent):
                 context_id=context_id,
             )
 
-        logger.debug(build_a2a_request_log(a2a_request))
+        logger.error("ADK PR 6370 TEST BUILD")
+        logger.error(build_a2a_request_log(a2a_request))
 
         try:
             a2a_request, parameters = await execute_before_request_interceptors(
@@ -781,7 +782,7 @@ class RemoteA2aAgent(BaseAgent):
                 context=parameters.client_call_context,
             ):
                 a2a_response = normalize_stream_item(raw_a2a_response)
-                logger.debug(build_a2a_response_log(a2a_response))
+                logger.error(build_a2a_response_log(a2a_response))
 
                 metadata = None
                 if isinstance(a2a_response, tuple):
@@ -869,9 +870,9 @@ class RemoteA2aAgent(BaseAgent):
         if self._httpx_client_needs_cleanup and self._httpx_client:
             try:
                 await self._httpx_client.aclose()
-                logger.debug("Closed HTTP client for agent %s", self.name)
+                logger.error("Closed HTTP client for agent %s", self.name)
             except Exception as e:
-                logger.warning(
+                logger.error(
                     "Failed to close HTTP client for agent %s: %s",
                     self.name,
                     e,
