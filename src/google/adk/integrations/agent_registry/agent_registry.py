@@ -16,47 +16,47 @@
 
 from __future__ import annotations
 
-from enum import Enum
 import logging
 import os
 import re
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Literal
-from typing import Mapping
-from typing import TypedDict
+from enum import Enum
+from typing import Any, Callable, Dict, List, Literal, Mapping, TypedDict
 from urllib.parse import urlparse
+
+import google.auth
+import httpx
+import requests
+from google.auth.transport import mtls
+from google.auth.transport import requests as requests_auth
+from mcp import StdioServerParameters
+from typing_extensions import override
 
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.auth.auth_credential import AuthCredential
 from google.adk.auth.auth_schemes import AuthScheme
-from google.adk.integrations.agent_identity.gcp_auth_provider_scheme import GcpAuthProviderScheme
+from google.adk.integrations.agent_identity.gcp_auth_provider_scheme import (
+    GcpAuthProviderScheme,
+)
 from google.adk.telemetry.tracing import GCP_MCP_SERVER_DESTINATION_ID
 from google.adk.tools.base_tool import BaseTool
-from google.adk.tools.mcp_tool.mcp_session_manager import SseConnectionParams
-from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
-from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool.mcp_session_manager import (
+    SseConnectionParams,
+    StdioConnectionParams,
+    StreamableHTTPConnectionParams,
+)
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
-import google.auth
-from google.auth.transport import mtls
-from google.auth.transport import requests as requests_auth
-import httpx
-from mcp import StdioServerParameters
-import requests
-from typing_extensions import override
 
 # pylint: disable=g-import-not-at-top
 try:
-  from a2a.types import AgentSkill
-  from google.adk.a2a import _compat
-  from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
+    from a2a.types import AgentSkill
+
+    from google.adk.a2a import _compat
+    from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 except ImportError as e:
-  raise ImportError(
-      "AgentRegistry requires the 'a2a-sdk' package. "
-      "Please install it using 'pip install google-adk[a2a]'."
-  ) from e
+    raise ImportError(
+        "AgentRegistry requires the 'a2a-sdk' package. "
+        "Please install it using 'pip install google-adk[a2a]'."
+    ) from e
 # pylint: enable=g-import-not-at-top
 
 logger = logging.getLogger("google_adk." + __name__)
@@ -75,630 +75,661 @@ _TRANSPORT_MAPPING = {
 # gcp.mcp.server.destination.id custom_metadata key on each returned tool. This special key is
 # added to execute_tool spans in google.adk.telemetry.tracing
 class AgentRegistrySingleMcpToolset(McpToolset):
+    def __init__(
+        self,
+        *,
+        destination_resource_id: str | None,
+        connection_params: (
+            StdioServerParameters
+            | StdioConnectionParams
+            | SseConnectionParams
+            | StreamableHTTPConnectionParams
+        ),
+        tool_name_prefix: str | None = None,
+        header_provider: (Callable[[ReadonlyContext], Dict[str, str]] | None) = None,
+        auth_scheme: AuthScheme | None = None,
+        auth_credential: AuthCredential | None = None,
+    ):
+        super().__init__(
+            connection_params=connection_params,
+            tool_name_prefix=tool_name_prefix,
+            header_provider=header_provider,
+            auth_scheme=auth_scheme,
+            auth_credential=auth_credential,
+        )
+        self.destination_resource_id = destination_resource_id
 
-  def __init__(
-      self,
-      *,
-      destination_resource_id: str | None,
-      connection_params: (
-          StdioServerParameters
-          | StdioConnectionParams
-          | SseConnectionParams
-          | StreamableHTTPConnectionParams
-      ),
-      tool_name_prefix: str | None = None,
-      header_provider: (
-          Callable[[ReadonlyContext], Dict[str, str]] | None
-      ) = None,
-      auth_scheme: AuthScheme | None = None,
-      auth_credential: AuthCredential | None = None,
-  ):
-    super().__init__(
-        connection_params=connection_params,
-        tool_name_prefix=tool_name_prefix,
-        header_provider=header_provider,
-        auth_scheme=auth_scheme,
-        auth_credential=auth_credential,
-    )
-    self.destination_resource_id = destination_resource_id
+    @override
+    async def get_tools(
+        self, readonly_context: ReadonlyContext | None = None
+    ) -> List[BaseTool]:
+        tools: List[BaseTool] = await super().get_tools(readonly_context)
 
-  @override
-  async def get_tools(
-      self, readonly_context: ReadonlyContext | None = None
-  ) -> List[BaseTool]:
-    tools: List[BaseTool] = await super().get_tools(readonly_context)
+        # Noop if there is no destination_resource_id
+        if self.destination_resource_id is None:
+            return tools
 
-    # Noop if there is no destination_resource_id
-    if self.destination_resource_id is None:
-      return tools
+        for tool in tools:
+            if not tool.custom_metadata:
+                tool.custom_metadata = {}
 
-    for tool in tools:
-      if not tool.custom_metadata:
-        tool.custom_metadata = {}
-
-      tool.custom_metadata[GCP_MCP_SERVER_DESTINATION_ID] = (
-          self.destination_resource_id
-      )
-    return tools
+            tool.custom_metadata[GCP_MCP_SERVER_DESTINATION_ID] = (
+                self.destination_resource_id
+            )
+        return tools
 
 
 class _MtlsEndpoint(Enum):
-  """The mTLS endpoint setting."""
+    """The mTLS endpoint setting."""
 
-  AUTO = "auto"
-  ALWAYS = "always"
-  NEVER = "never"
+    AUTO = "auto"
+    ALWAYS = "always"
+    NEVER = "never"
 
 
 class _ProtocolType(str, Enum):
-  """Supported agent protocol types."""
+    """Supported agent protocol types."""
 
-  TYPE_UNSPECIFIED = "TYPE_UNSPECIFIED"
-  A2A_AGENT = "A2A_AGENT"
-  CUSTOM = "CUSTOM"
+    TYPE_UNSPECIFIED = "TYPE_UNSPECIFIED"
+    A2A_AGENT = "A2A_AGENT"
+    CUSTOM = "CUSTOM"
 
 
 class Interface(TypedDict, total=False):
-  """Details for a single connection interface."""
+    """Details for a single connection interface."""
 
-  url: str
-  protocolBinding: str
+    url: str
+    protocolBinding: str
 
 
 class Endpoint(TypedDict, total=False):
-  """Full metadata for a registered Endpoint."""
+    """Full metadata for a registered Endpoint."""
 
-  name: str
-  endpointId: str
-  displayName: str
-  description: str
-  interfaces: List[Interface]
-  createTime: str
-  updateTime: str
-  attributes: Dict[str, Any]
+    name: str
+    endpointId: str
+    displayName: str
+    description: str
+    interfaces: List[Interface]
+    createTime: str
+    updateTime: str
+    attributes: Dict[str, Any]
 
 
 def _is_google_api(url: str) -> bool:
-  """Checks if the given URL points to a Google API endpoint."""
-  parsed_url = urlparse(url)
-  if not parsed_url.hostname:
-    return False
-  return (
-      parsed_url.hostname == "googleapis.com"
-      or parsed_url.hostname.endswith(".googleapis.com")
-  )
+    """Checks if the given URL points to a Google API endpoint."""
+    parsed_url = urlparse(url)
+    if not parsed_url.hostname:
+        return False
+
+    is_google_api_check = (
+        parsed_url.hostname == "googleapis.com"
+        or parsed_url.hostname.endswith(".googleapis.com")
+    )
+
+    logging.info(
+        f"[CALLUM] Are we pointing to a Google API endpoint?: {is_google_api_check} - hostname is: {parsed_url.hostname}"
+    )
+    return parsed_url.hostname == "googleapis.com" or parsed_url.hostname.endswith(
+        ".googleapis.com"
+    )
 
 
 class AgentRegistry:
-  """Client for interacting with the Google Cloud Agent Registry service.
+    """Client for interacting with the Google Cloud Agent Registry service.
 
-  Unlike a standard REST client library, this class provides higher-level
-  abstractions for ADK integration. It surfaces the agent registry service
-  methods along with helper methods like `get_mcp_toolset` and
-  `get_remote_a2a_agent` that automatically resolve connection details and
-  handle authentication to produce ready-to-use ADK components.
-  """
-
-  def __init__(
-      self,
-      project_id: str | None = None,
-      location: str | None = None,
-      header_provider: (
-          Callable[[ReadonlyContext], Dict[str, str]] | None
-      ) = None,
-  ):
-    """Initializes the AgentRegistry client.
-
-    Args:
-      project_id: The Google Cloud project ID.
-      location: The Google Cloud location (region).
-      header_provider: Optional provider for custom headers.
+    Unlike a standard REST client library, this class provides higher-level
+    abstractions for ADK integration. It surfaces the agent registry service
+    methods along with helper methods like `get_mcp_toolset` and
+    `get_remote_a2a_agent` that automatically resolve connection details and
+    handle authentication to produce ready-to-use ADK components.
     """
-    self.project_id = project_id
-    self.location = location
 
-    if not self.project_id or not self.location:
-      raise ValueError("project_id and location must be provided")
+    def __init__(
+        self,
+        project_id: str | None = None,
+        location: str | None = None,
+        header_provider: (Callable[[ReadonlyContext], Dict[str, str]] | None) = None,
+    ):
+        """Initializes the AgentRegistry client.
 
-    self._base_path = f"projects/{self.project_id}/locations/{self.location}"
-    self._header_provider = header_provider
-    try:
-      self._credentials, _ = google.auth.default()
-    except google.auth.exceptions.DefaultCredentialsError as e:
-      raise RuntimeError(
-          f"Failed to get default Google Cloud credentials: {e}"
-      ) from e
+        Args:
+          project_id: The Google Cloud project ID.
+          location: The Google Cloud location (region).
+          header_provider: Optional provider for custom headers.
+        """
+        self.project_id = project_id
+        self.location = location
 
-    # Instantiate and configure AuthorizedSession once during initialization.
-    self._session = requests_auth.AuthorizedSession(
-        credentials=self._credentials
-    )
-    use_client_cert = _use_client_cert_effective()
-    client_cert_source = None
-    if use_client_cert:
-      client_cert_source = (
-          mtls.default_client_cert_source()
-          if mtls.has_default_client_cert_source()
-          else None
-      )
-      self._session.configure_mtls_channel(client_cert_source)
-    self._base_url = _get_agent_registry_base_url(client_cert_source)
+        if not self.project_id or not self.location:
+            raise ValueError("project_id and location must be provided")
 
-  def _get_auth_headers(self) -> Dict[str, str]:
-    """Refreshes credentials and returns authorization headers."""
-    try:
-      request = google.auth.transport.requests.Request()
-      self._credentials.refresh(request)
-      headers = {
-          "Authorization": f"Bearer {self._credentials.token}",
-          "Content-Type": "application/json",
-      }
-      return headers
-    except google.auth.exceptions.RefreshError as e:
-      raise RuntimeError(
-          f"Failed to refresh Google Cloud credentials: {e}"
-      ) from e
+        self._base_path = f"projects/{self.project_id}/locations/{self.location}"
+        self._header_provider = header_provider
+        try:
+            self._credentials, _ = google.auth.default()
+        except google.auth.exceptions.DefaultCredentialsError as e:
+            raise RuntimeError(
+                f"Failed to get default Google Cloud credentials: {e}"
+            ) from e
 
-  def _make_request(
-      self,
-      path: str,
-      method: str = "GET",
-      params: Dict[str, Any] | None = None,
-      json_data: Dict[str, Any] | None = None,
-  ) -> Dict[str, Any]:
-    """Helper function to make requests to the Agent Registry API."""
-    if path.startswith("projects/"):
-      url = f"{self._base_url}/{path}"
-    else:
-      url = f"{self._base_url}/{self._base_path}/{path}"
-    quota_project_id = (
-        getattr(self._credentials, "quota_project_id", None) or self.project_id
-    )
-    headers = (
-        {"x-goog-user-project": quota_project_id} if quota_project_id else {}
-    )
-    try:
-      # Using AuthorizedSession for internal API calls to handle mTLS/Auth.
-      if method == "POST":
-        response = self._session.post(url, headers=headers, json=json_data)
-      else:
-        response = self._session.get(url, headers=headers, params=params)
-      response.raise_for_status()
-      data: Dict[str, Any] = response.json()
-      return data
-    except requests.exceptions.HTTPError as e:
-      raise RuntimeError(
-          f"API request failed with status {e.response.status_code}:"
-          f" {e.response.text}"
-      ) from e
-    except requests.exceptions.RequestException as e:
-      raise RuntimeError(f"API request failed (network error): {e}") from e
-    except Exception as e:
-      raise RuntimeError(f"API request failed: {e}") from e
+        # Instantiate and configure AuthorizedSession once during initialization.
+        self._session = requests_auth.AuthorizedSession(credentials=self._credentials)
+        use_client_cert = _use_client_cert_effective()
+        client_cert_source = None
+        if use_client_cert:
+            client_cert_source = (
+                mtls.default_client_cert_source()
+                if mtls.has_default_client_cert_source()
+                else None
+            )
+            self._session.configure_mtls_channel(client_cert_source)
+        self._base_url = _get_agent_registry_base_url(client_cert_source)
 
-  def _search(
-      self,
-      resource_type: str,
-      *,
-      search_string: str | None = None,
-      search_type: Literal["KEYWORD", "SEMANTIC"] | None = None,
-      filter_str: str | None = None,
-      order_by: str | None = None,
-      page_size: int | None = None,
-      page_token: str | None = None,
-  ) -> Dict[str, Any]:
-    """Helper function to execute search requests."""
-    json_data: dict[str, Any] = {}
-    if search_string is not None:
-      json_data["searchString"] = search_string
-    if search_type is not None:
-      json_data["searchType"] = search_type
-    if filter_str is not None:
-      json_data["filter"] = filter_str
-    if order_by is not None:
-      json_data["orderBy"] = order_by
-    if page_size is not None:
-      json_data["pageSize"] = page_size
-    if page_token is not None:
-      json_data["pageToken"] = page_token
-    return self._make_request(
-        f"{resource_type}:search", method="POST", json_data=json_data
-    )
+    def _get_auth_headers(self) -> Dict[str, str]:
+        """Refreshes credentials and returns authorization headers."""
+        try:
+            request = google.auth.transport.requests.Request()
+            self._credentials.refresh(request)
+            headers = {
+                "Authorization": f"Bearer {self._credentials.token}",
+                "Content-Type": "application/json",
+            }
+            return headers
+        except google.auth.exceptions.RefreshError as e:
+            raise RuntimeError(
+                f"Failed to refresh Google Cloud credentials: {e}"
+            ) from e
 
-  def _get_connection_uri(
-      self,
-      resource_details: Mapping[str, Any],
-      protocol_type: _ProtocolType | None = None,
-      protocol_binding: _compat.TransportProtocol | None = None,
-  ) -> tuple[str | None, str | None, _compat.TransportProtocol | None]:
-    """Extracts the first matching URI based on type and binding filters."""
-    protocols = list(resource_details.get("protocols", []))
-    if "interfaces" in resource_details:
-      protocols.append({"interfaces": resource_details["interfaces"]})
+    def _make_request(
+        self,
+        path: str,
+        method: str = "GET",
+        params: Dict[str, Any] | None = None,
+        json_data: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Helper function to make requests to the Agent Registry API."""
+        if path.startswith("projects/"):
+            url = f"{self._base_url}/{path}"
+        else:
+            url = f"{self._base_url}/{self._base_path}/{path}"
+        quota_project_id = (
+            getattr(self._credentials, "quota_project_id", None) or self.project_id
+        )
+        headers = {"x-goog-user-project": quota_project_id} if quota_project_id else {}
+        try:
+            # Using AuthorizedSession for internal API calls to handle mTLS/Auth.
+            if method == "POST":
+                response = self._session.post(url, headers=headers, json=json_data)
+            else:
+                response = self._session.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data: Dict[str, Any] = response.json()
+            return data
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(
+                f"API request failed with status {e.response.status_code}:"
+                f" {e.response.text}"
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"API request failed (network error): {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"API request failed: {e}") from e
 
-    for p in protocols:
-      if protocol_type and p.get("type") != protocol_type:
-        continue
-      protocol_version = p.get("protocolVersion")
-      for i in p.get("interfaces", []):
-        mapped_binding = _TRANSPORT_MAPPING.get(i.get("protocolBinding"))
-        if protocol_binding and mapped_binding != protocol_binding:
-          continue
-        if url := i.get("url"):
-          return url, protocol_version, mapped_binding
-
-    return None, None, None
-
-  def _clean_name(self, name: str) -> str:
-    """Cleans a string to be a valid Python identifier for agent names."""
-    clean = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-    clean = re.sub(r"_+", "_", clean)
-    clean = clean.strip("_")
-    if clean and not clean[0].isalpha() and clean[0] != "_":
-      clean = "_" + clean
-    return clean
-
-  # --- MCP Server Methods ---
-
-  def list_mcp_servers(
-      self,
-      filter_str: str | None = None,
-      page_size: int | None = None,
-      page_token: str | None = None,
-  ) -> Dict[str, Any]:
-    """Fetches a list of MCP Servers."""
-    params = {}
-    if filter_str:
-      params["filter"] = filter_str
-    if page_size:
-      params["pageSize"] = str(page_size)
-    if page_token:
-      params["pageToken"] = page_token
-    return self._make_request("mcpServers", params=params)
-
-  def search_mcp_servers(
-      self,
-      *,
-      search_string: str | None = None,
-      search_type: Literal["KEYWORD", "SEMANTIC"] | None = None,
-      filter_str: str | None = None,
-      order_by: str | None = None,
-      page_size: int | None = None,
-      page_token: str | None = None,
-  ) -> Dict[str, Any]:
-    """Searches registered MCP Servers."""
-    return self._search(
-        "mcpServers",
-        search_string=search_string,
-        search_type=search_type,
-        filter_str=filter_str,
-        order_by=order_by,
-        page_size=page_size,
-        page_token=page_token,
-    )
-
-  def get_mcp_server(self, name: str) -> Dict[str, Any]:
-    """Retrieves details of a specific MCP Server."""
-    return self._make_request(name)
-
-  def get_mcp_toolset(
-      self,
-      mcp_server_name: str,
-      auth_scheme: AuthScheme | None = None,
-      auth_credential: AuthCredential | None = None,
-      *,
-      continue_uri: str | None = None,
-  ) -> McpToolset:
-    """Constructs an McpToolset from a registered MCP Server.
-
-    If `auth_scheme` is omitted, it is automatically resolved from the server's
-    IAM bindings via `GcpAuthProviderScheme`.
-
-    Args:
-      mcp_server_name: Resource name of the MCP Server.
-      auth_scheme: Optional auth scheme. Resolved via bindings if omitted.
-      auth_credential: Optional auth credential.
-      continue_uri: Optional continue URI to override what is in the auth
-        provider.
-
-    Returns:
-      An McpToolset for the MCP server.
-    """
-    server_details = self.get_mcp_server(mcp_server_name)
-    name = self._clean_name(server_details.get("displayName", mcp_server_name))
-    mcp_server_id = server_details.get("mcpServerId")
-    if not isinstance(mcp_server_id, str):
-      mcp_server_id = None
-
-    endpoint_uri, _, _ = self._get_connection_uri(
-        server_details, protocol_binding=_compat.TP_JSONRPC
-    )
-    if not endpoint_uri:
-      endpoint_uri, _, _ = self._get_connection_uri(
-          server_details, protocol_binding=_compat.TP_HTTP_JSON
-      )
-    if not endpoint_uri:
-      raise ValueError(
-          f"MCP Server endpoint URI not found for: {mcp_server_name}"
-      )
-
-    if mcp_server_id and not auth_scheme:
-      try:
-        bindings_data = self._make_request("bindings")
-        for b in bindings_data.get("bindings", []):
-          target_id = b.get("target", {}).get("identifier", "")
-          if target_id.endswith(mcp_server_id):
-            auth_provider = b.get("authProviderBinding", {}).get("authProvider")
-            if auth_provider:
-              auth_scheme = GcpAuthProviderScheme(
-                  name=auth_provider, continue_uri=continue_uri
-              )
-              break
-      except Exception as e:
-        logger.warning(
-            f"Failed to fetch bindings for MCP Server {mcp_server_name}: {e}"
+    def _search(
+        self,
+        resource_type: str,
+        *,
+        search_string: str | None = None,
+        search_type: Literal["KEYWORD", "SEMANTIC"] | None = None,
+        filter_str: str | None = None,
+        order_by: str | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Helper function to execute search requests."""
+        json_data: dict[str, Any] = {}
+        if search_string is not None:
+            json_data["searchString"] = search_string
+        if search_type is not None:
+            json_data["searchType"] = search_type
+        if filter_str is not None:
+            json_data["filter"] = filter_str
+        if order_by is not None:
+            json_data["orderBy"] = order_by
+        if page_size is not None:
+            json_data["pageSize"] = page_size
+        if page_token is not None:
+            json_data["pageToken"] = page_token
+        return self._make_request(
+            f"{resource_type}:search", method="POST", json_data=json_data
         )
 
-    connection_params = StreamableHTTPConnectionParams(
-        url=endpoint_uri,
-    )
+    def _get_connection_uri(
+        self,
+        resource_details: Mapping[str, Any],
+        protocol_type: _ProtocolType | None = None,
+        protocol_binding: _compat.TransportProtocol | None = None,
+    ) -> tuple[str | None, str | None, _compat.TransportProtocol | None]:
+        """Extracts the first matching URI based on type and binding filters."""
+        protocols = list(resource_details.get("protocols", []))
+        if "interfaces" in resource_details:
+            protocols.append({"interfaces": resource_details["interfaces"]})
 
-    def combined_header_provider(context: ReadonlyContext) -> Dict[str, str]:
-      headers = {}
-      if (
-          not auth_scheme
-          and not auth_credential
-          and _is_google_api(endpoint_uri)
-      ):
-        headers.update(self._get_auth_headers())
-      if self._header_provider:
-        headers.update(self._header_provider(context))
-      return headers
+        for p in protocols:
+            if protocol_type and p.get("type") != protocol_type:
+                continue
+            protocol_version = p.get("protocolVersion")
+            for i in p.get("interfaces", []):
+                mapped_binding = _TRANSPORT_MAPPING.get(i.get("protocolBinding"))
+                if protocol_binding and mapped_binding != protocol_binding:
+                    continue
+                if url := i.get("url"):
+                    return url, protocol_version, mapped_binding
 
-    return AgentRegistrySingleMcpToolset(
-        destination_resource_id=mcp_server_id,
-        connection_params=connection_params,
-        tool_name_prefix=name,
-        header_provider=combined_header_provider,
-        auth_scheme=auth_scheme,
-        auth_credential=auth_credential,
-    )
+        return None, None, None
 
-  # --- Endpoint Methods ---
+    def _clean_name(self, name: str) -> str:
+        """Cleans a string to be a valid Python identifier for agent names."""
+        clean = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+        clean = re.sub(r"_+", "_", clean)
+        clean = clean.strip("_")
+        if clean and not clean[0].isalpha() and clean[0] != "_":
+            clean = "_" + clean
+        return clean
 
-  def list_endpoints(
-      self,
-      filter_str: str | None = None,
-      page_size: int | None = None,
-      page_token: str | None = None,
-  ) -> Dict[str, Any]:
-    """Fetches a list of Endpoints."""
-    params = {}
-    if filter_str:
-      params["filter"] = filter_str
-    if page_size:
-      params["pageSize"] = str(page_size)
-    if page_token:
-      params["pageToken"] = page_token
-    return self._make_request("endpoints", params=params)
+    # --- MCP Server Methods ---
 
-  def get_endpoint(self, name: str) -> Endpoint:
-    """Retrieves details of a specific Endpoint."""
-    return self._make_request(name)  # type: ignore
+    def list_mcp_servers(
+        self,
+        filter_str: str | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Fetches a list of MCP Servers."""
+        params = {}
+        if filter_str:
+            params["filter"] = filter_str
+        if page_size:
+            params["pageSize"] = str(page_size)
+        if page_token:
+            params["pageToken"] = page_token
+        return self._make_request("mcpServers", params=params)
 
-  def get_model_name(self, endpoint_name: str) -> str:
-    """Retrieves and parses an endpoint into a model resource name.
+    def search_mcp_servers(
+        self,
+        *,
+        search_string: str | None = None,
+        search_type: Literal["KEYWORD", "SEMANTIC"] | None = None,
+        filter_str: str | None = None,
+        order_by: str | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Searches registered MCP Servers."""
+        return self._search(
+            "mcpServers",
+            search_string=search_string,
+            search_type=search_type,
+            filter_str=filter_str,
+            order_by=order_by,
+            page_size=page_size,
+            page_token=page_token,
+        )
 
-    Args:
-      endpoint_name: The full resource name of the endpoint.
+    def get_mcp_server(self, name: str) -> Dict[str, Any]:
+        """Retrieves details of a specific MCP Server."""
+        return self._make_request(name)
 
-    Returns:
-      The resolved model resource name string (e.g.
-      projects/.../locations/.../publishers/google/models/...).
-    """
-    endpoint_details = self.get_endpoint(endpoint_name)
-    uri, _, _ = self._get_connection_uri(endpoint_details)
-    if not uri:
-      raise ValueError(
-          f"Connection URI not found for endpoint: {endpoint_name}"
-      )
+    def get_mcp_toolset(
+        self,
+        mcp_server_name: str,
+        auth_scheme: AuthScheme | None = None,
+        auth_credential: AuthCredential | None = None,
+        *,
+        continue_uri: str | None = None,
+    ) -> McpToolset:
+        """Constructs an McpToolset from a registered MCP Server.
 
-    uri = re.sub(r":\w+$", "", uri)
+        If `auth_scheme` is omitted, it is automatically resolved from the server's
+        IAM bindings via `GcpAuthProviderScheme`.
 
-    if uri.startswith("projects/"):
-      return uri
+        Args:
+          mcp_server_name: Resource name of the MCP Server.
+          auth_scheme: Optional auth scheme. Resolved via bindings if omitted.
+          auth_credential: Optional auth credential.
+          continue_uri: Optional continue URI to override what is in the auth
+            provider.
 
-    match = re.search(r"(projects/.+)", uri)
-    if match:
-      return match.group(1)
+        Returns:
+          An McpToolset for the MCP server.
+        """
+        server_details = self.get_mcp_server(mcp_server_name)
+        name = self._clean_name(server_details.get("displayName", mcp_server_name))
+        mcp_server_id = server_details.get("mcpServerId")
+        if not isinstance(mcp_server_id, str):
+            mcp_server_id = None
 
-    return uri
+        endpoint_uri, _, _ = self._get_connection_uri(
+            server_details, protocol_binding=_compat.TP_JSONRPC
+        )
+        if not endpoint_uri:
+            endpoint_uri, _, _ = self._get_connection_uri(
+                server_details, protocol_binding=_compat.TP_HTTP_JSON
+            )
+        if not endpoint_uri:
+            raise ValueError(
+                f"MCP Server endpoint URI not found for: {mcp_server_name}"
+            )
 
-  # --- Agent Methods ---
+        if mcp_server_id and not auth_scheme:
+            try:
+                bindings_data = self._make_request("bindings")
+                for b in bindings_data.get("bindings", []):
+                    target_id = b.get("target", {}).get("identifier", "")
+                    if target_id.endswith(mcp_server_id):
+                        auth_provider = b.get("authProviderBinding", {}).get(
+                            "authProvider"
+                        )
+                        if auth_provider:
+                            auth_scheme = GcpAuthProviderScheme(
+                                name=auth_provider, continue_uri=continue_uri
+                            )
+                            break
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch bindings for MCP Server {mcp_server_name}: {e}"
+                )
 
-  def list_agents(
-      self,
-      filter_str: str | None = None,
-      page_size: int | None = None,
-      page_token: str | None = None,
-  ) -> Dict[str, Any]:
-    """Fetches a list of registered A2A Agents."""
-    params = {}
-    if filter_str:
-      params["filter"] = filter_str
-    if page_size:
-      params["pageSize"] = str(page_size)
-    if page_token:
-      params["pageToken"] = page_token
-    return self._make_request("agents", params=params)
+        connection_params = StreamableHTTPConnectionParams(
+            url=endpoint_uri,
+        )
 
-  def search_agents(
-      self,
-      *,
-      search_string: str | None = None,
-      search_type: Literal["KEYWORD", "SEMANTIC"] | None = None,
-      filter_str: str | None = None,
-      order_by: str | None = None,
-      page_size: int | None = None,
-      page_token: str | None = None,
-  ) -> Dict[str, Any]:
-    """Searches registered A2A Agents."""
-    return self._search(
-        "agents",
-        search_string=search_string,
-        search_type=search_type,
-        filter_str=filter_str,
-        order_by=order_by,
-        page_size=page_size,
-        page_token=page_token,
-    )
+        def combined_header_provider(context: ReadonlyContext) -> Dict[str, str]:
+            headers = {}
+            if not auth_scheme and not auth_credential and _is_google_api(endpoint_uri):
+                headers.update(self._get_auth_headers())
+            if self._header_provider:
+                headers.update(self._header_provider(context))
+            return headers
 
-  def get_agent_info(self, name: str) -> Dict[str, Any]:
-    """Retrieves detailed metadata of a specific A2A Agent."""
-    return self._make_request(name)
+        return AgentRegistrySingleMcpToolset(
+            destination_resource_id=mcp_server_id,
+            connection_params=connection_params,
+            tool_name_prefix=name,
+            header_provider=combined_header_provider,
+            auth_scheme=auth_scheme,
+            auth_credential=auth_credential,
+        )
 
-  def get_remote_a2a_agent(
-      self,
-      agent_name: str,
-      *,
-      httpx_client: httpx.AsyncClient | None = None,
-  ) -> RemoteA2aAgent:
-    """Creates a RemoteA2aAgent instance for a registered A2A Agent."""
-    agent_info = self.get_agent_info(agent_name)
+    # --- Endpoint Methods ---
 
-    # Try to use the full agent card if available
-    card = agent_info.get("card", {})
-    card_content = card.get("content")
-    if card.get("type") == "A2A_AGENT_CARD" and card_content:
-      agent_card = _compat.parse_agent_card(card_content)
-      # Clean the name to be a valid identifier
-      name = self._clean_name(agent_card.name)
+    def list_endpoints(
+        self,
+        filter_str: str | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Fetches a list of Endpoints."""
+        params = {}
+        if filter_str:
+            params["filter"] = filter_str
+        if page_size:
+            params["pageSize"] = str(page_size)
+        if page_token:
+            params["pageToken"] = page_token
+        return self._make_request("endpoints", params=params)
 
-      return RemoteA2aAgent(
-          name=name,
-          agent_card=agent_card,
-          description=agent_card.description,
-          httpx_client=httpx_client,
-          enable_google_auth_mtls=_resolve_a2a_mtls_opt_in(
-              httpx_client, _compat.agent_card_url(agent_card)
-          ),
-      )
+    def get_endpoint(self, name: str) -> Endpoint:
+        """Retrieves details of a specific Endpoint."""
+        return self._make_request(name)  # type: ignore
 
-    name = self._clean_name(agent_info.get("displayName", agent_name))
-    description = agent_info.get("description", "")
-    version = agent_info.get("version", "")
+    def get_model_name(self, endpoint_name: str) -> str:
+        """Retrieves and parses an endpoint into a model resource name.
 
-    url, protocol_version, protocol_binding = self._get_connection_uri(
-        agent_info, protocol_type=_ProtocolType.A2A_AGENT
-    )
-    if not url:
-      raise ValueError(f"A2A connection URI not found for Agent: {agent_name}")
+        Args:
+          endpoint_name: The full resource name of the endpoint.
 
-    skills = []
-    for s in agent_info.get("skills", []):
-      skills.append(
-          AgentSkill(
-              id=s.get("id"),
-              name=s.get("name"),
-              description=s.get("description", ""),
-              tags=s.get("tags", []),
-              examples=s.get("examples", []),
-          )
-      )
+        Returns:
+          The resolved model resource name string (e.g.
+          projects/.../locations/.../publishers/google/models/...).
+        """
+        endpoint_details = self.get_endpoint(endpoint_name)
+        uri, _, _ = self._get_connection_uri(endpoint_details)
+        if not uri:
+            raise ValueError(f"Connection URI not found for endpoint: {endpoint_name}")
 
-    binding = protocol_binding or _compat.TP_HTTP_JSON
-    agent_card = _compat.build_agent_card(
-        name=name,
-        description=description,
-        version=version,
-        url=url,
-        protocol_binding=getattr(binding, "value", binding),
-        protocol_version=protocol_version,
-        skills=skills,
-        default_input_modes=["text"],
-        default_output_modes=["text"],
-    )
+        uri = re.sub(r":\w+$", "", uri)
 
-    return RemoteA2aAgent(
-        name=name,
-        agent_card=agent_card,
-        description=description,
-        httpx_client=httpx_client,
-        enable_google_auth_mtls=_resolve_a2a_mtls_opt_in(httpx_client, url),
-    )
+        if uri.startswith("projects/"):
+            return uri
+
+        match = re.search(r"(projects/.+)", uri)
+        if match:
+            return match.group(1)
+
+        return uri
+
+    # --- Agent Methods ---
+
+    def list_agents(
+        self,
+        filter_str: str | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Fetches a list of registered A2A Agents."""
+        params = {}
+        if filter_str:
+            params["filter"] = filter_str
+        if page_size:
+            params["pageSize"] = str(page_size)
+        if page_token:
+            params["pageToken"] = page_token
+        return self._make_request("agents", params=params)
+
+    def search_agents(
+        self,
+        *,
+        search_string: str | None = None,
+        search_type: Literal["KEYWORD", "SEMANTIC"] | None = None,
+        filter_str: str | None = None,
+        order_by: str | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Searches registered A2A Agents."""
+        return self._search(
+            "agents",
+            search_string=search_string,
+            search_type=search_type,
+            filter_str=filter_str,
+            order_by=order_by,
+            page_size=page_size,
+            page_token=page_token,
+        )
+
+    def get_agent_info(self, name: str) -> Dict[str, Any]:
+        """Retrieves detailed metadata of a specific A2A Agent."""
+        return self._make_request(name)
+
+    def get_remote_a2a_agent(
+        self,
+        agent_name: str,
+        *,
+        httpx_client: httpx.AsyncClient | None = None,
+    ) -> RemoteA2aAgent:
+        """Creates a RemoteA2aAgent instance for a registered A2A Agent."""
+        agent_info = self.get_agent_info(agent_name)
+
+        # Try to use the full agent card if available
+        card = agent_info.get("card", {})
+        card_content = card.get("content")
+        if card.get("type") == "A2A_AGENT_CARD" and card_content:
+            agent_card = _compat.parse_agent_card(card_content)
+            # Clean the name to be a valid identifier
+            name = self._clean_name(agent_card.name)
+
+            logging.info("[CALLUM]: We're at the top RemoteA2aAgent return")
+            logging.info(
+                f"Value of `enable_google_auth_mtls` in RemoteA2aAgent return: {_resolve_a2a_mtls_opt_in(httpx_client, _compat.agent_card_url(agent_card))}"
+            )
+            return RemoteA2aAgent(
+                name=name,
+                agent_card=agent_card,
+                description=agent_card.description,
+                httpx_client=httpx_client,
+                enable_google_auth_mtls=_resolve_a2a_mtls_opt_in(
+                    httpx_client, _compat.agent_card_url(agent_card)
+                ),
+            )
+
+        name = self._clean_name(agent_info.get("displayName", agent_name))
+        description = agent_info.get("description", "")
+        version = agent_info.get("version", "")
+
+        url, protocol_version, protocol_binding = self._get_connection_uri(
+            agent_info, protocol_type=_ProtocolType.A2A_AGENT
+        )
+        logging.info(
+            f"[CALLUM]: Using protocol version {protocol_version} and protocol binding: {protocol_binding} for URL: {url}"
+        )
+        if not url:
+            raise ValueError(f"A2A connection URI not found for Agent: {agent_name}")
+
+        skills = []
+        for s in agent_info.get("skills", []):
+            skills.append(
+                AgentSkill(
+                    id=s.get("id"),
+                    name=s.get("name"),
+                    description=s.get("description", ""),
+                    tags=s.get("tags", []),
+                    examples=s.get("examples", []),
+                )
+            )
+
+        binding = protocol_binding or _compat.TP_HTTP_JSON
+        agent_card = _compat.build_agent_card(
+            name=name,
+            description=description,
+            version=version,
+            url=url,
+            protocol_binding=getattr(binding, "value", binding),
+            protocol_version=protocol_version,
+            skills=skills,
+            default_input_modes=["text"],
+            default_output_modes=["text"],
+        )
+        logging.info("[CALLUM]: We're at the bottom RemoteA2aAgent return")
+        logging.info(
+            f"Value of `enable_google_auth_mtls` in RemoteA2aAgent return: {_resolve_a2a_mtls_opt_in(httpx_client, url)}"
+        )
+        return RemoteA2aAgent(
+            name=name,
+            agent_card=agent_card,
+            description=description,
+            httpx_client=httpx_client,
+            enable_google_auth_mtls=_resolve_a2a_mtls_opt_in(httpx_client, url),
+        )
 
 
 def _use_client_cert_effective() -> bool:
-  """Returns whether client certificate should be used for mTLS."""
-  try:
-    # If the google.auth.transport.mtls.should_use_client_cert function is
-    # available, use it to determine whether client certificate should be used.
-    return bool(mtls.should_use_client_cert())
-  except (ImportError, AttributeError):
-    use_client_cert_str = os.getenv(
-        "GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"
-    ).lower()
-    return use_client_cert_str == "true"
+    """Returns whether client certificate should be used for mTLS."""
+    try:
+        # If the google.auth.transport.mtls.should_use_client_cert function is
+        # available, use it to determine whether client certificate should be used.
+        logging.info(
+            f"[CALLUM]: `Here we dedeice whether the client certificate should be used for mTLS. Result: {bool(mtls.should_use_client_cert())}`"
+        )
+        return bool(mtls.should_use_client_cert())
+    except (ImportError, AttributeError):
+        use_client_cert_str = os.getenv(
+            "GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"
+        ).lower()
+        logging.info(
+            f"[CALLUM]: An error happened in use_client_cert_effective: here is the fallback result: {use_client_cert_str == 'true'}"
+        )
+        return use_client_cert_str == "true"
 
 
 def _mtls_endpoint_setting() -> _MtlsEndpoint:
-  """Returns the GOOGLE_API_USE_MTLS_ENDPOINT setting, defaulting to AUTO."""
-  use_mtls_endpoint_str = os.getenv(
-      "GOOGLE_API_USE_MTLS_ENDPOINT", _MtlsEndpoint.AUTO.value
-  ).lower()
-  try:
-    return _MtlsEndpoint(use_mtls_endpoint_str)
-  except ValueError:
-    return _MtlsEndpoint.AUTO
+    """Returns the GOOGLE_API_USE_MTLS_ENDPOINT setting, defaulting to AUTO."""
+    use_mtls_endpoint_str = os.getenv(
+        "GOOGLE_API_USE_MTLS_ENDPOINT", _MtlsEndpoint.AUTO.value
+    ).lower()
+    logging.info(f"[CALLUM]: Using MTLS endpoint setting: {use_mtls_endpoint_str}")
+    try:
+        return _MtlsEndpoint(use_mtls_endpoint_str)
+    except ValueError:
+        return _MtlsEndpoint.AUTO
 
 
 def _get_agent_registry_base_url(client_cert_source: Any | None = None) -> str:
-  """Returns the base URL based on mTLS configuration and cert availability."""
-  use_mtls_endpoint = _mtls_endpoint_setting()
-  if (use_mtls_endpoint is _MtlsEndpoint.ALWAYS) or (
-      use_mtls_endpoint is _MtlsEndpoint.AUTO and client_cert_source is not None
-  ):
-    return AGENT_REGISTRY_MTLS_BASE_URL
-  return AGENT_REGISTRY_BASE_URL
+    """Returns the base URL based on mTLS configuration and cert availability."""
+    use_mtls_endpoint = _mtls_endpoint_setting()
+    logging.info(
+        f"[CALLUM]: Inside get_agent_registry_base_url: Using MTLS endpoint setting: {use_mtls_endpoint}"
+    )
+    if (use_mtls_endpoint is _MtlsEndpoint.ALWAYS) or (
+        use_mtls_endpoint is _MtlsEndpoint.AUTO and client_cert_source is not None
+    ):
+        logging.info(f"[CALLUM]: Using MTLS BASE URL!!!!")
+        return AGENT_REGISTRY_MTLS_BASE_URL
+    logging.info(f"[CALLUM]: NOT using MTLS base url :(")
+    return AGENT_REGISTRY_BASE_URL
 
 
 def _should_use_google_auth_mtls(url: str | None) -> bool:
-  """Whether outbound A2A calls to `url` should use a google-auth mTLS transport.
+    """Whether outbound A2A calls to `url` should use a google-auth mTLS transport.
 
-  Google context-aware access policies (Agent Identity) bind access tokens to an
-  mTLS channel, so a Google-hosted A2A endpoint must be reached over mTLS or it
-  rejects the bound token with a 401. This gates that behavior to Google
-  endpoints when a client certificate is configured and mTLS is not opted out.
-  """
-  return bool(
-      url
-      and _is_google_api(url)
-      and _use_client_cert_effective()
-      and _mtls_endpoint_setting() is not _MtlsEndpoint.NEVER
-  )
+    Google context-aware access policies (Agent Identity) bind access tokens to an
+    mTLS channel, so a Google-hosted A2A endpoint must be reached over mTLS or it
+    rejects the bound token with a 401. This gates that behavior to Google
+    endpoints when a client certificate is configured and mTLS is not opted out.
+    """
+    should_use_google_auth_mtls_check = bool(
+        url
+        and _is_google_api(url)
+        and _use_client_cert_effective()
+        and _mtls_endpoint_setting() is not _MtlsEndpoint.NEVER
+    )
+    logging.info(
+        f"[CALLUM]: Are we using Google Auth MTLS?: {should_use_google_auth_mtls_check}"
+    )
+    return bool(
+        url
+        and _is_google_api(url)
+        and _use_client_cert_effective()
+        and _mtls_endpoint_setting() is not _MtlsEndpoint.NEVER
+    )
 
 
 def _resolve_a2a_mtls_opt_in(
     httpx_client: httpx.AsyncClient | None, url: str | None
 ) -> bool:
-  """Decides whether the RemoteA2aAgent should build a google-auth mTLS client.
+    """Decides whether the RemoteA2aAgent should build a google-auth mTLS client.
 
-  A caller-supplied `httpx_client` is never overridden, but if mTLS would
-  otherwise be required for this endpoint, a plain client will have its
-  channel-bound (Agent Identity) token rejected with 401 UNAUTHENTICATED — so
-  warn loudly instead of failing silently.
-  """
-  if not _should_use_google_auth_mtls(url):
-    return False
-  if httpx_client is not None:
-    logger.warning(
-        "A custom httpx_client was supplied for the Google A2A endpoint %s"
-        " while mTLS client certificates are configured. The supplied client"
-        " will be used as-is; if it does not present the client certificate,"
-        " channel-bound credentials (e.g. Agent Identity) will be rejected"
-        " with 401 UNAUTHENTICATED. Omit httpx_client to let ADK build an"
-        " mTLS-capable client automatically.",
-        url,
-    )
-    return False
-  return True
+    A caller-supplied `httpx_client` is never overridden, but if mTLS would
+    otherwise be required for this endpoint, a plain client will have its
+    channel-bound (Agent Identity) token rejected with 401 UNAUTHENTICATED — so
+    warn loudly instead of failing silently.
+    """
+    if not _should_use_google_auth_mtls(url):
+        logging.info(
+            "[CALLUM] We're not using mTLS because _should_use_google_auth_mtls is Falsy."
+        )
+        return False
+    if httpx_client is not None:
+        logger.warning(
+            "A custom httpx_client was supplied for the Google A2A endpoint %s"
+            " while mTLS client certificates are configured. The supplied client"
+            " will be used as-is; if it does not present the client certificate,"
+            " channel-bound credentials (e.g. Agent Identity) will be rejected"
+            " with 401 UNAUTHENTICATED. Omit httpx_client to let ADK build an"
+            " mTLS-capable client automatically.",
+            url,
+        )
+        logging.info("[CALLUM] We're not using mTLS because a httpx_client is enabled!")
+        return False
+    logging.info("[CALLUM] YAY we're finally using mTLS!!!!")
+    return True
