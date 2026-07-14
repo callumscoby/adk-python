@@ -362,6 +362,34 @@ class RemoteA2aAgent(BaseAgent):
                 if not self.description and self._agent_card.description:
                     self.description = self._agent_card.description
 
+            # --- MTLS URL REWRITE PATCH ---
+            if self._enable_google_auth_mtls and self._agent_card:
+                card_url = _compat.agent_card_url(self._agent_card)
+                if card_url:
+                    parsed_url = urlparse(str(card_url))
+                    hostname = parsed_url.hostname
+                    if (
+                        hostname
+                        and hostname.endswith("googleapis.com")
+                        and ".mtls." not in hostname
+                    ):
+                        # Rewrite 'europe-west1-aiplatform.googleapis.com' to 'europe-west1-aiplatform.mtls.googleapis.com'
+                        mtls_hostname = hostname.replace(
+                            "googleapis.com", "mtls.googleapis.com"
+                        )
+                        rewritten_url = str(card_url).replace(hostname, mtls_hostname)
+
+                        try:
+                            self._agent_card.url = rewritten_url
+                        except AttributeError:
+                            # If self._agent_card is a Pydantic model and immutable
+                            self._agent_card = self._agent_card.model_copy(
+                                update={"url": rewritten_url}
+                            )
+                        logger.error(
+                            f"[CALLUM] Rewrote standard URL to mTLS endpoint: {self._agent_card.url}"
+                        )
+
             # Initialize A2A client
             if not self._a2a_client:
                 await self._ensure_httpx_client()
